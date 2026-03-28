@@ -1,24 +1,13 @@
-from __future__ import annotations
-
-import os
-
 from agno.knowledge.reader.pdf_reader import PDFReader
 
-
-PDF_CHUNK_SIZE = int(os.getenv("PDF_CHUNK_SIZE", "3000"))
-PDF_SPLIT_ON_PAGES = os.getenv("PDF_SPLIT_ON_PAGES", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+from utils.settings import PDF_CHUNK_SIZE, PDF_SPLIT_ON_PAGES
 
 
 def build_pdf_reader(
-    chunk_size: int = PDF_CHUNK_SIZE,
-    split_on_pages: bool = PDF_SPLIT_ON_PAGES,
+    chunk_size: int | None = None,
+    split_on_pages: bool | None = None,
 ) -> PDFReader:
     return PDFReader(
-        chunk_size=chunk_size,
-        split_on_pages=split_on_pages,
+        chunk_size=PDF_CHUNK_SIZE if chunk_size is None else chunk_size,
+        split_on_pages=PDF_SPLIT_ON_PAGES if split_on_pages is None else split_on_pages,
     )
