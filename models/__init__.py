@@ -1,10 +1,16 @@
-from .builder_models import ManimVideoPlan, SceneAsset, SceneCode
-from .narrator_models import NarrationScript, NarrationSection
+from models.builder import ManimVideoPlan, SceneCode
+from models.storyboard import AssetRequirement, Storyboard, StoryboardScene
+from models.teaching_outline import TeachingOutline, TeachingSection
+from models.validation import StoryboardValidationReport, ValidationIssue
 
 __all__ = [
+    "AssetRequirement",
     "ManimVideoPlan",
-    "NarrationScript",
-    "NarrationSection",
-    "SceneAsset",
     "SceneCode",
+    "Storyboard",
+    "StoryboardScene",
+    "StoryboardValidationReport",
+    "TeachingOutline",
+    "TeachingSection",
+    "ValidationIssue",
 ]
