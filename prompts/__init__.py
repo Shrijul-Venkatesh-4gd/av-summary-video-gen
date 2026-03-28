@@ -1,0 +1,8 @@
+from prompts.storyboard import BUILDER_AGENT_PROMPT, STORYBOARD_AGENT_PROMPT
+from prompts.teaching_outline import TEACHING_OUTLINE_AGENT_PROMPT
+
+__all__ = [
+    "BUILDER_AGENT_PROMPT",
+    "STORYBOARD_AGENT_PROMPT",
+    "TEACHING_OUTLINE_AGENT_PROMPT",
+]
