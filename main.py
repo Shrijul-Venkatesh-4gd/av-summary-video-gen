@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from knowledge.pdf_store import get_pdf_dir, ingest_pdfs
+from knowledge.retrieval import retrieve_budgeted_chunks
 from models.api import (
     ArtifactManifest,
     ArtifactResponse,
@@ -23,11 +24,43 @@ from models.api import (
     WorkflowRequest,
 )
 from models.builder import ManimVideoPlan, SceneCode
+from models.grounded_notes import GroundedNotes
+from models.observability import (
+    RetrievedSourceChunk,
+    RetrievalStats,
+    StageMetrics,
+    WorkflowManifestMetadata,
+)
 from models.storyboard import Storyboard
 from models.teaching_outline import TeachingOutline
 from models.validation import StoryboardValidationReport
-from utils.scene_templates import build_scene_template_brief
+from prompts.grounded_notes import GROUNDED_NOTES_AGENT_PROMPT
+from prompts.storyboard import BUILDER_AGENT_PROMPT, STORYBOARD_AGENT_PROMPT
+from prompts.teaching_outline import TEACHING_OUTLINE_AGENT_PROMPT
+from utils.budgeting import (
+    assert_no_raw_source_leakage,
+    ensure_within_budget,
+    estimate_tokens,
+)
 from utils.validation import validate_storyboard
+from utils.settings import (
+    MAX_BUILDER_CHARACTERS,
+    MAX_BUILDER_INPUT_TOKENS,
+    MAX_GROUNDED_NOTES_CHARACTERS,
+    MAX_GROUNDED_NOTES_TOKENS,
+    MAX_OUTLINE_CHARACTERS,
+    MAX_OUTLINE_INPUT_TOKENS,
+    MAX_STORYBOARD_CHARACTERS,
+    MAX_STORYBOARD_INPUT_TOKENS,
+    OPENROUTER_MODEL_BUILDER,
+    OPENROUTER_MODEL_GROUNDED_NOTES,
+    OPENROUTER_MODEL_STORYBOARD,
+    OPENROUTER_MODEL_TEACHING_OUTLINE,
+    STAGE_OUTPUT_MAX_TOKENS_BUILDER,
+    STAGE_OUTPUT_MAX_TOKENS_GROUNDED_NOTES,
+    STAGE_OUTPUT_MAX_TOKENS_OUTLINE,
+    STAGE_OUTPUT_MAX_TOKENS_STORYBOARD,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 GENERATED_ROOT_DIR = PROJECT_ROOT / "generated"
@@ -52,7 +85,10 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 app = FastAPI(
     title="AV Summary Video Generator",
-    description="FastAPI service for PDF ingestion, teaching-outline generation, storyboard design, and Manim planning.",
+    description=(
+        "FastAPI service for PDF ingestion, budgeted retrieval, grounded-notes "
+        "compression, teaching-outline generation, storyboard design, and Manim planning."
+    ),
 )
 
 
@@ -92,6 +128,7 @@ def _write_manifest(
     request_path: str,
     artifacts: dict[str, str],
     notes: list[str] | None = None,
+    metadata: WorkflowManifestMetadata | None = None,
 ) -> ArtifactResponse:
     manifest = ArtifactManifest(
         endpoint=endpoint,
@@ -101,6 +138,7 @@ def _write_manifest(
         request_path=request_path,
         artifacts=artifacts,
         notes=notes or [],
+        metadata={} if metadata is None else metadata.model_dump(mode="json"),
     )
     manifest_path = artifact_dir / "manifest.json"
     _write_json_artifact(manifest_path, manifest.model_dump(mode="json"))
@@ -233,34 +271,201 @@ def _raise_if_invalid_storyboard(report: StoryboardValidationReport) -> None:
     )
 
 
+def _log_retrieval_stats(stats: RetrievalStats) -> None:
+    print(
+        "[retrieval] "
+        f"calls={stats.retrieval_calls}/{stats.max_retrieval_calls} "
+        f"candidates={stats.candidate_chunks} selected={stats.selected_chunks} "
+        f"tokens~{stats.source_tokens_estimate} chars={stats.source_characters}"
+    )
+
+
+def _log_stage_metrics(metric: StageMetrics) -> None:
+    print(
+        f"[{metric.stage_name}] "
+        f"model={metric.model} "
+        f"input_tokens~{metric.input_tokens_estimate}/{metric.input_tokens_limit} "
+        f"output_tokens~{metric.output_tokens_estimate}/{metric.output_tokens_limit} "
+        f"bytes={metric.serialized_artifact_bytes} "
+        f"compression={metric.compression_applied} "
+        f"truncation={metric.truncation_applied}"
+    )
+
+
+def _make_stage_metric(
+    *,
+    stage_name: str,
+    model: str,
+    input_payload: Any,
+    input_limit: int,
+    output_payload: Any,
+    output_limit: int,
+    compression_applied: bool = False,
+    truncation_applied: bool = False,
+    warnings: list[str] | None = None,
+) -> StageMetrics:
+    serialized_output = (
+        output_payload.model_dump_json(indent=2, exclude_none=True)
+        if isinstance(output_payload, BaseModel)
+        else json.dumps(output_payload, indent=2, ensure_ascii=False, default=str)
+    )
+    metric = StageMetrics(
+        stage_name=stage_name,
+        model=model,
+        input_tokens_estimate=estimate_tokens(input_payload),
+        input_tokens_limit=input_limit,
+        output_tokens_estimate=estimate_tokens(serialized_output),
+        output_tokens_limit=output_limit,
+        serialized_artifact_bytes=len(serialized_output.encode("utf-8")),
+        compression_applied=compression_applied,
+        truncation_applied=truncation_applied,
+        warnings=warnings or [],
+    )
+    _log_stage_metrics(metric)
+    return metric
+
+
+def _retrieval_query(topic: str, audience: str, duration_min: int) -> str:
+    return dedent(
+        f"""
+        Topic: {topic}
+        Audience: {audience}
+        Requested duration: about {duration_min} minutes
+
+        Retrieve only the most relevant chunks needed to explain this topic accurately to this audience.
+        """
+    ).strip()
+
+
+def _run_grounded_notes_stage(
+    *,
+    topic: str,
+    audience: str,
+    duration_min: int,
+) -> tuple[GroundedNotes, list[RetrievedSourceChunk], RetrievalStats, StageMetrics]:
+    from agents.grounded_notes import grounded_notes_agent
+
+    retrieval_query = _retrieval_query(topic, audience, duration_min)
+    retrieved_chunks, retrieval_stats = retrieve_budgeted_chunks(retrieval_query)
+    _log_retrieval_stats(retrieval_stats)
+
+    chunk_payload = [
+        {
+            "chunk_id": chunk.chunk_id,
+            "document_name": chunk.document_name,
+            "locator": chunk.locator,
+            "similarity_score": chunk.similarity_score,
+            "content": chunk.content,
+        }
+        for chunk in retrieved_chunks
+    ]
+    prompt = dedent(
+        f"""
+        Create compact grounded notes for this lesson request.
+
+        Request:
+        {json.dumps(
+            {
+                "topic": topic,
+                "audience": audience,
+                "duration_min": duration_min,
+            },
+            indent=2,
+        )}
+
+        Retrieved evidence JSON:
+        {json.dumps(chunk_payload, indent=2)}
+
+        Keep the artifact compact because later stages only receive these grounded notes.
+        """
+    ).strip()
+    ensure_within_budget(
+        stage_name="grounded_notes",
+        payload=f"{GROUNDED_NOTES_AGENT_PROMPT}\n\n{prompt}",
+        max_tokens=retrieval_stats.source_tokens_estimate + MAX_GROUNDED_NOTES_TOKENS,
+        max_characters=retrieval_stats.source_characters + MAX_GROUNDED_NOTES_CHARACTERS,
+        budget_label="retrieval compression input",
+    )
+    response = grounded_notes_agent.run(prompt)
+    grounded_notes = _coerce_agent_content(response.content, GroundedNotes)
+    retrieval_stats = retrieval_stats.model_copy(update={"compression_applied": True})
+    ensure_within_budget(
+        stage_name="grounded_notes",
+        payload=grounded_notes,
+        max_tokens=MAX_GROUNDED_NOTES_TOKENS,
+        max_characters=MAX_GROUNDED_NOTES_CHARACTERS,
+        budget_label="artifact",
+    )
+    stage_metric = _make_stage_metric(
+        stage_name="grounded_notes",
+        model=OPENROUTER_MODEL_GROUNDED_NOTES,
+        input_payload=f"{GROUNDED_NOTES_AGENT_PROMPT}\n\n{prompt}",
+        input_limit=retrieval_stats.source_tokens_estimate + MAX_GROUNDED_NOTES_TOKENS,
+        output_payload=grounded_notes,
+        output_limit=STAGE_OUTPUT_MAX_TOKENS_GROUNDED_NOTES,
+        compression_applied=True,
+        warnings=list(retrieval_stats.warnings),
+    )
+    return grounded_notes, retrieved_chunks, retrieval_stats, stage_metric
+
+
 def _run_teaching_outline_agent(
     topic: str,
     audience: str,
     duration_min: int,
-) -> TeachingOutline:
+    grounded_notes: GroundedNotes,
+    retrieved_chunks: list[RetrievedSourceChunk],
+) -> tuple[TeachingOutline, StageMetrics]:
     from agents.narrator import teaching_outline_agent
 
     prompt = dedent(
         f"""
-        Create a grounded teaching outline using the knowledge base.
+        Create a teaching outline from these grounded notes.
 
-        Topic focus:
-        {topic}
+        Request:
+        {json.dumps(
+            {
+                "topic": topic,
+                "audience": audience,
+                "duration_min": duration_min,
+            },
+            indent=2,
+        )}
 
-        Audience:
-        {audience}
+        Grounded notes JSON:
+        {grounded_notes.model_dump_json(indent=2)}
 
-        Target duration:
-        about {duration_min} minutes
-
-        Design this like a beginner-friendly lesson, not like PDF notes.
+        Keep the lesson tightly scoped and beginner-friendly.
         """
     ).strip()
+    assert_no_raw_source_leakage(
+        stage_name="teaching_outline",
+        payload=prompt,
+        raw_source_texts=[chunk.content for chunk in retrieved_chunks],
+    )
+    ensure_within_budget(
+        stage_name="teaching_outline",
+        payload=f"{TEACHING_OUTLINE_AGENT_PROMPT}\n\n{prompt}",
+        max_tokens=MAX_OUTLINE_INPUT_TOKENS,
+        max_characters=MAX_OUTLINE_CHARACTERS,
+    )
     response = teaching_outline_agent.run(prompt)
-    return _coerce_agent_content(response.content, TeachingOutline)
+    teaching_outline = _coerce_agent_content(response.content, TeachingOutline)
+    stage_metric = _make_stage_metric(
+        stage_name="teaching_outline",
+        model=OPENROUTER_MODEL_TEACHING_OUTLINE,
+        input_payload=f"{TEACHING_OUTLINE_AGENT_PROMPT}\n\n{prompt}",
+        input_limit=MAX_OUTLINE_INPUT_TOKENS,
+        output_payload=teaching_outline,
+        output_limit=STAGE_OUTPUT_MAX_TOKENS_OUTLINE,
+    )
+    return teaching_outline, stage_metric
 
 
-def _run_storyboard_agent(teaching_outline: TeachingOutline) -> Storyboard:
+def _run_storyboard_agent(
+    teaching_outline: TeachingOutline,
+    retrieved_chunks: list[RetrievedSourceChunk] | None = None,
+) -> tuple[Storyboard, StageMetrics]:
     from agents.storyboard import storyboarder
 
     prompt = dedent(
@@ -270,22 +475,40 @@ def _run_storyboard_agent(teaching_outline: TeachingOutline) -> Storyboard:
         Teaching outline JSON:
         {teaching_outline.model_dump_json(indent=2)}
 
-        Make scene-to-scene variety intentional and pedagogically justified.
+        Keep scene count and on-screen text tightly bounded.
         """
     ).strip()
+    if retrieved_chunks is not None:
+        assert_no_raw_source_leakage(
+            stage_name="storyboard",
+            payload=prompt,
+            raw_source_texts=[chunk.content for chunk in retrieved_chunks],
+        )
+    ensure_within_budget(
+        stage_name="storyboard",
+        payload=f"{STORYBOARD_AGENT_PROMPT}\n\n{prompt}",
+        max_tokens=MAX_STORYBOARD_INPUT_TOKENS,
+        max_characters=MAX_STORYBOARD_CHARACTERS,
+    )
     response = storyboarder.run(prompt)
-    return _coerce_agent_content(response.content, Storyboard)
+    storyboard = _coerce_agent_content(response.content, Storyboard)
+    stage_metric = _make_stage_metric(
+        stage_name="storyboard",
+        model=OPENROUTER_MODEL_STORYBOARD,
+        input_payload=f"{STORYBOARD_AGENT_PROMPT}\n\n{prompt}",
+        input_limit=MAX_STORYBOARD_INPUT_TOKENS,
+        output_payload=storyboard,
+        output_limit=STAGE_OUTPUT_MAX_TOKENS_STORYBOARD,
+    )
+    return storyboard, stage_metric
 
 
 def _run_builder_agent(
     storyboard: Storyboard,
-    validation_report: StoryboardValidationReport,
-) -> ManimVideoPlan:
+    retrieved_chunks: list[RetrievedSourceChunk] | None = None,
+) -> tuple[ManimVideoPlan, StageMetrics]:
     from agents.builder import builder
 
-    scene_template_briefs = [
-        build_scene_template_brief(scene) for scene in storyboard.scenes
-    ]
     prompt = dedent(
         f"""
         Convert this storyboard into a Manim video plan.
@@ -293,17 +516,65 @@ def _run_builder_agent(
         Storyboard JSON:
         {storyboard.model_dump_json(indent=2)}
 
-        Validation report JSON:
-        {validation_report.model_dump_json(indent=2)}
-
-        Scene template briefs:
-        {json.dumps(scene_template_briefs, indent=2)}
-
         Respect the storyboard scene order exactly.
         """
     ).strip()
+    if retrieved_chunks is not None:
+        assert_no_raw_source_leakage(
+            stage_name="builder",
+            payload=prompt,
+            raw_source_texts=[chunk.content for chunk in retrieved_chunks],
+        )
+    ensure_within_budget(
+        stage_name="builder",
+        payload=f"{BUILDER_AGENT_PROMPT}\n\n{prompt}",
+        max_tokens=MAX_BUILDER_INPUT_TOKENS,
+        max_characters=MAX_BUILDER_CHARACTERS,
+    )
     response = builder.run(prompt)
-    return _coerce_agent_content(response.content, ManimVideoPlan)
+    plan = _coerce_agent_content(response.content, ManimVideoPlan)
+    stage_metric = _make_stage_metric(
+        stage_name="builder",
+        model=OPENROUTER_MODEL_BUILDER,
+        input_payload=f"{BUILDER_AGENT_PROMPT}\n\n{prompt}",
+        input_limit=MAX_BUILDER_INPUT_TOKENS,
+        output_payload=plan,
+        output_limit=STAGE_OUTPUT_MAX_TOKENS_BUILDER,
+    )
+    return plan, stage_metric
+
+
+def _run_outline_stack(
+    *,
+    topic: str,
+    audience: str,
+    duration_min: int,
+) -> tuple[
+    GroundedNotes,
+    list[RetrievedSourceChunk],
+    RetrievalStats,
+    TeachingOutline,
+    list[StageMetrics],
+]:
+    grounded_notes, retrieved_chunks, retrieval_stats, grounded_notes_metric = _run_grounded_notes_stage(
+        topic=topic,
+        audience=audience,
+        duration_min=duration_min,
+    )
+    teaching_outline, outline_metric = _run_teaching_outline_agent(
+        topic=topic,
+        audience=audience,
+        duration_min=duration_min,
+        grounded_notes=grounded_notes,
+        retrieved_chunks=retrieved_chunks,
+    )
+    return (
+        grounded_notes,
+        retrieved_chunks,
+        retrieval_stats,
+        teaching_outline,
+        [grounded_notes_metric, outline_metric],
+    )
 
 
 def _run_workflow(request: WorkflowRequest) -> ArtifactResponse:
@@ -329,15 +600,31 @@ def _run_workflow(request: WorkflowRequest) -> ArtifactResponse:
             "force_reingest": request.force_reingest,
         }
 
-    teaching_outline = _run_teaching_outline_agent(
+    (
+        grounded_notes,
+        retrieved_chunks,
+        retrieval_stats,
+        teaching_outline,
+        stage_metrics,
+    ) = _run_outline_stack(
         topic=request.topic,
         audience=request.audience,
         duration_min=request.duration_min,
     )
-    storyboard = _run_storyboard_agent(teaching_outline)
+    storyboard, storyboard_metric = _run_storyboard_agent(teaching_outline, retrieved_chunks)
     validation_report = validate_storyboard(storyboard)
     _raise_if_invalid_storyboard(validation_report)
-    plan = _sanitize_plan(_run_builder_agent(storyboard, validation_report), storyboard)
+    plan, builder_metric = _run_builder_agent(storyboard, retrieved_chunks)
+    plan = _sanitize_plan(plan, storyboard)
+
+    metadata = WorkflowManifestMetadata(
+        retrieval_stats=retrieval_stats,
+        stage_metrics=[*stage_metrics, storyboard_metric, builder_metric],
+        compression_decisions=["Compressed retrieved chunks into grounded_notes.json before lesson generation."],
+        truncation_decisions=[],
+        warnings=[*retrieval_stats.warnings],
+    )
+
     notes = _validation_notes(validation_report)
     run_id, created_at, artifact_dir = _create_artifact_dir(
         endpoint="workflow",
@@ -352,6 +639,14 @@ def _run_workflow(request: WorkflowRequest) -> ArtifactResponse:
     ingestion_path = _write_json_artifact(
         artifact_dir / "ingestion.json",
         ingestion_summary,
+    )
+    retrieval_path = _write_json_artifact(
+        artifact_dir / "retrieved_sources.json",
+        [chunk.model_dump(mode="json") for chunk in retrieved_chunks],
+    )
+    grounded_notes_path = _write_json_artifact(
+        artifact_dir / "grounded_notes.json",
+        grounded_notes.model_dump(mode="json"),
     )
     teaching_outline_path = _write_json_artifact(
         artifact_dir / "teaching_outline.json",
@@ -379,6 +674,8 @@ def _run_workflow(request: WorkflowRequest) -> ArtifactResponse:
         request_path=request_path,
         artifacts={
             "ingestion": ingestion_path,
+            "retrieved_sources": retrieval_path,
+            "grounded_notes": grounded_notes_path,
             "teaching_outline": teaching_outline_path,
             "storyboard": storyboard_path,
             "storyboard_validation": validation_path,
@@ -386,6 +683,7 @@ def _run_workflow(request: WorkflowRequest) -> ArtifactResponse:
             "generated_scene_module": module_path,
         },
         notes=notes,
+        metadata=metadata,
     )
 
 
@@ -437,7 +735,13 @@ def ingest_endpoint(request: IngestRequest) -> ArtifactResponse:
 @app.post("/outline", response_model=ArtifactResponse)
 def outline_endpoint(request: OutlineRequest) -> ArtifactResponse:
     try:
-        teaching_outline = _run_teaching_outline_agent(
+        (
+            grounded_notes,
+            retrieved_chunks,
+            retrieval_stats,
+            teaching_outline,
+            stage_metrics,
+        ) = _run_outline_stack(
             topic=request.topic,
             audience=request.audience,
             duration_min=request.duration_min,
@@ -445,6 +749,12 @@ def outline_endpoint(request: OutlineRequest) -> ArtifactResponse:
     except (FileNotFoundError, ValueError) as exc:
         raise _bad_request(exc) from exc
 
+    metadata = WorkflowManifestMetadata(
+        retrieval_stats=retrieval_stats,
+        stage_metrics=stage_metrics,
+        compression_decisions=["Compressed retrieved chunks into grounded_notes.json before outline generation."],
+        warnings=[*retrieval_stats.warnings],
+    )
     run_id, created_at, artifact_dir = _create_artifact_dir(
         endpoint="outline",
         label=request.topic,
@@ -452,6 +762,14 @@ def outline_endpoint(request: OutlineRequest) -> ArtifactResponse:
     request_path = _write_json_artifact(
         artifact_dir / "request.json",
         request.model_dump(mode="json"),
+    )
+    retrieval_path = _write_json_artifact(
+        artifact_dir / "retrieved_sources.json",
+        [chunk.model_dump(mode="json") for chunk in retrieved_chunks],
+    )
+    grounded_notes_path = _write_json_artifact(
+        artifact_dir / "grounded_notes.json",
+        grounded_notes.model_dump(mode="json"),
     )
     outline_path = _write_json_artifact(
         artifact_dir / "teaching_outline.json",
@@ -464,14 +782,25 @@ def outline_endpoint(request: OutlineRequest) -> ArtifactResponse:
         created_at=created_at,
         artifact_dir=artifact_dir,
         request_path=request_path,
-        artifacts={"teaching_outline": outline_path},
+        artifacts={
+            "retrieved_sources": retrieval_path,
+            "grounded_notes": grounded_notes_path,
+            "teaching_outline": outline_path,
+        },
+        metadata=metadata,
     )
 
 
 @app.post("/narrate", response_model=ArtifactResponse)
 def narrate_endpoint(request: NarrateRequest) -> ArtifactResponse:
     try:
-        teaching_outline = _run_teaching_outline_agent(
+        (
+            grounded_notes,
+            retrieved_chunks,
+            retrieval_stats,
+            teaching_outline,
+            stage_metrics,
+        ) = _run_outline_stack(
             topic=request.topic,
             audience=request.audience,
             duration_min=request.duration_min,
@@ -479,6 +808,12 @@ def narrate_endpoint(request: NarrateRequest) -> ArtifactResponse:
     except (FileNotFoundError, ValueError) as exc:
         raise _bad_request(exc) from exc
 
+    metadata = WorkflowManifestMetadata(
+        retrieval_stats=retrieval_stats,
+        stage_metrics=stage_metrics,
+        compression_decisions=["Compressed retrieved chunks into grounded_notes.json before outline generation."],
+        warnings=[*retrieval_stats.warnings],
+    )
     run_id, created_at, artifact_dir = _create_artifact_dir(
         endpoint="narrate",
         label=request.topic,
@@ -486,6 +821,14 @@ def narrate_endpoint(request: NarrateRequest) -> ArtifactResponse:
     request_path = _write_json_artifact(
         artifact_dir / "request.json",
         request.model_dump(mode="json"),
+    )
+    retrieval_path = _write_json_artifact(
+        artifact_dir / "retrieved_sources.json",
+        [chunk.model_dump(mode="json") for chunk in retrieved_chunks],
+    )
+    grounded_notes_path = _write_json_artifact(
+        artifact_dir / "grounded_notes.json",
+        grounded_notes.model_dump(mode="json"),
     )
     outline_path = _write_json_artifact(
         artifact_dir / "teaching_outline.json",
@@ -498,21 +841,27 @@ def narrate_endpoint(request: NarrateRequest) -> ArtifactResponse:
         created_at=created_at,
         artifact_dir=artifact_dir,
         request_path=request_path,
-        artifacts={"teaching_outline": outline_path},
+        artifacts={
+            "retrieved_sources": retrieval_path,
+            "grounded_notes": grounded_notes_path,
+            "teaching_outline": outline_path,
+        },
         notes=["The /narrate endpoint is a compatibility alias for /outline."],
+        metadata=metadata,
     )
 
 
 @app.post("/storyboard", response_model=ArtifactResponse)
 def storyboard_endpoint(request: StoryboardRequest) -> ArtifactResponse:
     try:
-        storyboard = _run_storyboard_agent(request.teaching_outline)
+        storyboard, storyboard_metric = _run_storyboard_agent(request.teaching_outline)
         validation_report = validate_storyboard(storyboard)
         _raise_if_invalid_storyboard(validation_report)
     except ValueError as exc:
         raise _bad_request(exc) from exc
 
     notes = _validation_notes(validation_report)
+    metadata = WorkflowManifestMetadata(stage_metrics=[storyboard_metric], warnings=notes)
     run_id, created_at, artifact_dir = _create_artifact_dir(
         endpoint="storyboard",
         label=request.teaching_outline.video_title,
@@ -547,6 +896,7 @@ def storyboard_endpoint(request: StoryboardRequest) -> ArtifactResponse:
             "storyboard_validation": validation_path,
         },
         notes=notes,
+        metadata=metadata,
     )
 
 
@@ -555,14 +905,13 @@ def build_endpoint(request: BuildRequest) -> ArtifactResponse:
     try:
         validation_report = validate_storyboard(request.storyboard)
         _raise_if_invalid_storyboard(validation_report)
-        plan = _sanitize_plan(
-            _run_builder_agent(request.storyboard, validation_report),
-            request.storyboard,
-        )
+        plan, builder_metric = _run_builder_agent(request.storyboard)
+        plan = _sanitize_plan(plan, request.storyboard)
     except ValueError as exc:
         raise _bad_request(exc) from exc
 
     notes = _validation_notes(validation_report)
+    metadata = WorkflowManifestMetadata(stage_metrics=[builder_metric], warnings=notes)
     run_id, created_at, artifact_dir = _create_artifact_dir(
         endpoint="build",
         label=request.storyboard.video_title,
@@ -599,6 +948,7 @@ def build_endpoint(request: BuildRequest) -> ArtifactResponse:
             "generated_scene_module": module_path,
         },
         notes=notes,
+        metadata=metadata,
     )
 
 

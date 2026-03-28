@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from utils.settings import MAX_OUTLINE_SECTIONS, MAX_TOTAL_LESSON_DURATION_SEC
 
 
 class TeachingSection(BaseModel):
@@ -64,3 +66,27 @@ class TeachingOutline(BaseModel):
         min_length=1,
         description="Ordered teaching sections, each centered on one main idea",
     )
+
+    @field_validator("sections")
+    @classmethod
+    def _limit_section_count(cls, value: list[TeachingSection]) -> list[TeachingSection]:
+        if len(value) > MAX_OUTLINE_SECTIONS:
+            raise ValueError(
+                f"Teaching outline may include at most {MAX_OUTLINE_SECTIONS} sections."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_total_duration(self) -> "TeachingOutline":
+        inferred_duration = sum(section.estimated_duration_sec for section in self.sections)
+        if self.total_estimated_duration_sec > MAX_TOTAL_LESSON_DURATION_SEC:
+            raise ValueError(
+                f"Teaching outline exceeds the configured lesson duration limit of "
+                f"{MAX_TOTAL_LESSON_DURATION_SEC} seconds."
+            )
+        if inferred_duration > MAX_TOTAL_LESSON_DURATION_SEC:
+            raise ValueError(
+                f"Teaching outline section durations exceed the configured lesson duration "
+                f"limit of {MAX_TOTAL_LESSON_DURATION_SEC} seconds."
+            )
+        return self

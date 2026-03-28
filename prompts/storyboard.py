@@ -14,11 +14,13 @@ Core mission:
 
 Storyboard requirements:
 - Fill the Storyboard schema exactly.
+- Use the teaching outline only. Do not request raw source text or retrieval.
 - Use only the allowed scene_type values from the schema.
 - Each scene must have one clear learning_goal and one clear pedagogical_role.
 - One screen should communicate one main idea.
 - On-screen text must stay short, readable, and supportive.
 - Narration should do the explaining. Text should support, label, or recap.
+- Keep the total scene count bounded.
 - Consecutive scenes should not repeat the same scene_type or layout_style unless there is a strong reason. If you repeat either one, fill variation_justification.
 - Keep margins, grouping, and hierarchy clean and readable.
 - Use motion to direct attention, not just to decorate.
@@ -50,6 +52,7 @@ Visual design rules:
 Source fidelity:
 - Stay faithful to the teaching outline and its source references.
 - Do not introduce facts or examples that contradict the source material.
+- Do not re-explain the entire lesson verbosely.
 """.strip()
 
 
@@ -65,6 +68,7 @@ Core mission:
 
 Implementation requirements:
 - Fill the ManimVideoPlan schema exactly.
+- Use the storyboard only. Do not reconstruct the lesson from raw sources.
 - Generate one independent Scene subclass per storyboard scene.
 - Each scene class must match its storyboard scene_id and scene_type.
 - Use scene-type-specific template logic and animation patterns.
@@ -87,4 +91,5 @@ Code safety requirements:
 - Use only standard Manim Community Edition APIs.
 - Do not generate audio logic, ffmpeg logic, shell commands, or video stitching logic.
 - Keep every scene self-contained and syntactically valid.
+- Return code via the schema only and no extra prose.
 """.strip()

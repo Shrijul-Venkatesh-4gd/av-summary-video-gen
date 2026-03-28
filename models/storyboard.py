@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from utils.budgeting import count_words
+from utils.settings import (
+    MAX_ON_SCREEN_WORDS_PER_SCENE,
+    MAX_SCENE_NARRATION_WORDS,
+    MAX_STORYBOARD_SCENES,
+    MAX_TOTAL_LESSON_DURATION_SEC,
+)
 
 
 SceneType = Literal[
@@ -89,6 +97,26 @@ class StoryboardScene(BaseModel):
         description="Why a repeated layout or scene type is justified here",
     )
 
+    @field_validator("narration_text")
+    @classmethod
+    def _limit_narration_words(cls, value: str) -> str:
+        if count_words(value) > MAX_SCENE_NARRATION_WORDS:
+            raise ValueError(
+                f"Storyboard narration must stay within {MAX_SCENE_NARRATION_WORDS} words per scene."
+            )
+        return value
+
+    @field_validator("on_screen_text")
+    @classmethod
+    def _limit_on_screen_words(cls, value: list[str]) -> list[str]:
+        total_words = sum(count_words(line) for line in value)
+        if total_words > MAX_ON_SCREEN_WORDS_PER_SCENE:
+            raise ValueError(
+                f"Storyboard on-screen text must stay within {MAX_ON_SCREEN_WORDS_PER_SCENE} "
+                "words per scene."
+            )
+        return value
+
 
 class Storyboard(BaseModel):
     video_title: str = Field(description="Title of the lesson video")
@@ -113,3 +141,27 @@ class Storyboard(BaseModel):
         min_length=1,
         description="Ordered storyboard scenes for the lesson",
     )
+
+    @field_validator("scenes")
+    @classmethod
+    def _limit_scene_count(cls, value: list[StoryboardScene]) -> list[StoryboardScene]:
+        if len(value) > MAX_STORYBOARD_SCENES:
+            raise ValueError(
+                f"Storyboard may include at most {MAX_STORYBOARD_SCENES} scenes."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_total_duration(self) -> "Storyboard":
+        inferred_duration = sum(scene.estimated_duration_sec for scene in self.scenes)
+        if self.total_estimated_duration_sec > MAX_TOTAL_LESSON_DURATION_SEC:
+            raise ValueError(
+                f"Storyboard exceeds the configured lesson duration limit of "
+                f"{MAX_TOTAL_LESSON_DURATION_SEC} seconds."
+            )
+        if inferred_duration > MAX_TOTAL_LESSON_DURATION_SEC:
+            raise ValueError(
+                f"Storyboard scene durations exceed the configured lesson duration limit "
+                f"of {MAX_TOTAL_LESSON_DURATION_SEC} seconds."
+            )
+        return self

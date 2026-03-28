@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from models.storyboard import Storyboard
@@ -68,6 +70,7 @@ class ArtifactManifest(BaseModel):
     request_path: str
     artifacts: dict[str, str] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ArtifactResponse(BaseModel):

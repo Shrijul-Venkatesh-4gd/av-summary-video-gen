@@ -3,6 +3,13 @@ from __future__ import annotations
 from models.storyboard import Storyboard
 from models.validation import StoryboardValidationReport, ValidationIssue
 from utils.assets import ASSET_CATALOG
+from utils.budgeting import count_words
+from utils.settings import (
+    MAX_ON_SCREEN_WORDS_PER_SCENE,
+    MAX_SCENE_NARRATION_WORDS,
+    MAX_STORYBOARD_SCENES,
+    MAX_TOTAL_LESSON_DURATION_SEC,
+)
 
 
 ATTENTION_RESET_SCENE_TYPES = {"hook_question", "quiz_pause", "recap_card", "summary_board"}
@@ -14,6 +21,38 @@ def validate_storyboard(storyboard: Storyboard) -> StoryboardValidationReport:
     type_streak = 1
     layout_streak = 1
     unique_scene_types = {scene.scene_type for scene in storyboard.scenes}
+    inferred_total_duration = sum(scene.estimated_duration_sec for scene in storyboard.scenes)
+
+    if len(storyboard.scenes) > MAX_STORYBOARD_SCENES:
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="too_many_scenes",
+                message=f"Storyboard exceeds the configured scene limit of {MAX_STORYBOARD_SCENES}.",
+            )
+        )
+    if storyboard.total_estimated_duration_sec > MAX_TOTAL_LESSON_DURATION_SEC:
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="lesson_duration_limit_exceeded",
+                message=(
+                    "Storyboard total duration exceeds the configured lesson duration "
+                    f"limit of {MAX_TOTAL_LESSON_DURATION_SEC} seconds."
+                ),
+            )
+        )
+    if inferred_total_duration > MAX_TOTAL_LESSON_DURATION_SEC:
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                code="scene_duration_limit_exceeded",
+                message=(
+                    "Combined scene durations exceed the configured lesson duration "
+                    f"limit of {MAX_TOTAL_LESSON_DURATION_SEC} seconds."
+                ),
+            )
+        )
 
     previous_scene = None
     previous_transition = None
@@ -41,18 +80,36 @@ def validate_storyboard(storyboard: Storyboard) -> StoryboardValidationReport:
                 )
             )
 
-        word_count = sum(len(line.split()) for line in scene.on_screen_text)
-        if word_count > 36:
+        narration_word_count = count_words(scene.narration_text)
+        if narration_word_count > MAX_SCENE_NARRATION_WORDS:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="narration_too_long",
+                    message=(
+                        "Narration is too long for one scene. Keep narration within "
+                        f"{MAX_SCENE_NARRATION_WORDS} words."
+                    ),
+                    scene_id=scene.scene_id,
+                    field_name="narration_text",
+                )
+            )
+
+        word_count = sum(count_words(line) for line in scene.on_screen_text)
+        if word_count > MAX_ON_SCREEN_WORDS_PER_SCENE:
             issues.append(
                 ValidationIssue(
                     severity="error",
                     code="too_much_on_screen_text",
-                    message="On-screen text is too dense for one scene. Keep text short and scannable.",
+                    message=(
+                        "On-screen text is too dense for one scene. Keep text within "
+                        f"{MAX_ON_SCREEN_WORDS_PER_SCENE} words."
+                    ),
                     scene_id=scene.scene_id,
                     field_name="on_screen_text",
                 )
             )
-        elif word_count > 24:
+        elif word_count > max(8, MAX_ON_SCREEN_WORDS_PER_SCENE - 4):
             issues.append(
                 ValidationIssue(
                     severity="warning",
