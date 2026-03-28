@@ -15,18 +15,30 @@ from utils.settings import (
 
 SceneType = Literal[
     "title_card",
+    "title_intro",
     "hook_question",
+    "concept_build",
     "concept_map",
     "step_by_step_reveal",
     "comparison",
     "worked_example",
     "state_transition",
     "code_demo",
+    "code_walkthrough",
     "diagram_explainer",
     "process_flow",
     "recap_card",
     "quiz_pause",
     "summary_board",
+]
+
+SemanticColorRole = Literal[
+    "focus",
+    "secondary",
+    "warning",
+    "success",
+    "active_path",
+    "muted_structure",
 ]
 
 
@@ -43,6 +55,15 @@ class AssetRequirement(BaseModel):
     )
 
 
+class SemanticColorAssignment(BaseModel):
+    role: SemanticColorRole = Field(
+        description="Semantic color role applied consistently in the scene"
+    )
+    target: str = Field(
+        description="Concept, label, or relation that should receive this color role"
+    )
+
+
 class StoryboardScene(BaseModel):
     scene_id: str = Field(description="Stable identifier such as scene_01")
     scene_title: str = Field(description="Short human-readable scene title")
@@ -54,6 +75,10 @@ class StoryboardScene(BaseModel):
     on_screen_text: list[str] = Field(
         default_factory=list,
         description="Short supporting text fragments suitable for readable captions or labels",
+    )
+    key_terms: list[str] = Field(
+        default_factory=list,
+        description="Short concept labels that can become nodes, chips, or anchors in the scene",
     )
     visual_strategy: str = Field(
         description="How the visual layout teaches the idea"
@@ -68,6 +93,13 @@ class StoryboardScene(BaseModel):
     emphasis_targets: list[str] = Field(
         default_factory=list,
         description="Words or elements that should receive visual emphasis",
+    )
+    visual_focus: str = Field(
+        description="The single main visual object, relation, or contrast the learner should notice first"
+    )
+    semantic_color_roles: list[SemanticColorAssignment] = Field(
+        default_factory=list,
+        description="Explicit semantic color mapping for important concepts or relations in the scene",
     )
     estimated_duration_sec: int = Field(
         ge=8,
@@ -115,6 +147,20 @@ class StoryboardScene(BaseModel):
                 f"Storyboard on-screen text must stay within {MAX_ON_SCREEN_WORDS_PER_SCENE} "
                 "words per scene."
             )
+        return value
+
+    @field_validator("visual_focus")
+    @classmethod
+    def _require_visual_focus(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Storyboard scenes must define a clear visual_focus.")
+        return value
+
+    @field_validator("semantic_color_roles")
+    @classmethod
+    def _require_semantic_colors(cls, value: list[SemanticColorAssignment]) -> list[SemanticColorAssignment]:
+        if not value:
+            raise ValueError("Storyboard scenes must assign at least one semantic color role.")
         return value
 
 

@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from agents.builder import TEMPLATE_BUILDER_MODEL_NAME, build_manim_video_plan
 from knowledge.pdf_store import get_pdf_dir, ingest_pdfs
 from knowledge.retrieval import retrieve_budgeted_chunks
 from models.api import (
@@ -35,7 +36,7 @@ from models.storyboard import Storyboard
 from models.teaching_outline import TeachingOutline
 from models.validation import StoryboardValidationReport
 from prompts.grounded_notes import GROUNDED_NOTES_AGENT_PROMPT
-from prompts.storyboard import BUILDER_AGENT_PROMPT, STORYBOARD_AGENT_PROMPT
+from prompts.storyboard import STORYBOARD_AGENT_PROMPT
 from prompts.teaching_outline import TEACHING_OUTLINE_AGENT_PROMPT
 from utils.budgeting import (
     assert_no_raw_source_leakage,
@@ -45,14 +46,12 @@ from utils.budgeting import (
 from utils.validation import validate_storyboard
 from utils.settings import (
     MAX_BUILDER_CHARACTERS,
-    MAX_BUILDER_INPUT_TOKENS,
     MAX_GROUNDED_NOTES_CHARACTERS,
     MAX_GROUNDED_NOTES_TOKENS,
     MAX_OUTLINE_CHARACTERS,
     MAX_OUTLINE_INPUT_TOKENS,
     MAX_STORYBOARD_CHARACTERS,
     MAX_STORYBOARD_INPUT_TOKENS,
-    OPENROUTER_MODEL_BUILDER,
     OPENROUTER_MODEL_GROUNDED_NOTES,
     OPENROUTER_MODEL_STORYBOARD,
     OPENROUTER_MODEL_TEACHING_OUTLINE,
@@ -181,7 +180,7 @@ def _sanitize_scene(scene: SceneCode) -> SceneCode:
     normalized_code = _normalize_scene_code(scene.code)
 
     expected_class = re.compile(
-        rf"class\s+{re.escape(scene.class_name)}\s*\(\s*Scene\s*\)\s*:"
+        rf"class\s+{re.escape(scene.class_name)}\s*\(\s*(?:Scene|ExplainerScene)\s*\)\s*:"
     )
     if not expected_class.search(normalized_code):
         raise ValueError(
@@ -234,7 +233,12 @@ def _save_manim_plan(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     module_path = output_dir / filename
-    module_lines = ["from manim import *", ""]
+    module_lines = [
+        "import json",
+        "from manim import *",
+        "from visuals.scene_templates import ExplainerScene, SceneSpec, render_storyboard_scene",
+        "",
+    ]
     if plan.shared_notes:
         module_lines.extend(f"# {note}" for note in plan.shared_notes)
         module_lines.append("")
@@ -507,37 +511,18 @@ def _run_builder_agent(
     storyboard: Storyboard,
     retrieved_chunks: list[RetrievedSourceChunk] | None = None,
 ) -> tuple[ManimVideoPlan, StageMetrics]:
-    from agents.builder import builder
-
-    prompt = dedent(
-        f"""
-        Convert this storyboard into a Manim video plan.
-
-        Storyboard JSON:
-        {storyboard.model_dump_json(indent=2)}
-
-        Respect the storyboard scene order exactly.
-        """
-    ).strip()
     if retrieved_chunks is not None:
         assert_no_raw_source_leakage(
             stage_name="builder",
-            payload=prompt,
+            payload=storyboard.model_dump_json(indent=2),
             raw_source_texts=[chunk.content for chunk in retrieved_chunks],
         )
-    ensure_within_budget(
-        stage_name="builder",
-        payload=f"{BUILDER_AGENT_PROMPT}\n\n{prompt}",
-        max_tokens=MAX_BUILDER_INPUT_TOKENS,
-        max_characters=MAX_BUILDER_CHARACTERS,
-    )
-    response = builder.run(prompt)
-    plan = _coerce_agent_content(response.content, ManimVideoPlan)
+    plan = build_manim_video_plan(storyboard)
     stage_metric = _make_stage_metric(
         stage_name="builder",
-        model=OPENROUTER_MODEL_BUILDER,
-        input_payload=f"{BUILDER_AGENT_PROMPT}\n\n{prompt}",
-        input_limit=MAX_BUILDER_INPUT_TOKENS,
+        model=TEMPLATE_BUILDER_MODEL_NAME,
+        input_payload=storyboard,
+        input_limit=MAX_BUILDER_CHARACTERS,
         output_payload=plan,
         output_limit=STAGE_OUTPUT_MAX_TOKENS_BUILDER,
     )

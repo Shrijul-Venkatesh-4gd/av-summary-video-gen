@@ -13,6 +13,28 @@ from utils.settings import (
 
 
 ATTENTION_RESET_SCENE_TYPES = {"hook_question", "quiz_pause", "recap_card", "summary_board"}
+ACCENT_ROLES = {"focus", "secondary", "active_path", "warning", "success"}
+
+
+def _looks_like_text_slide(scene) -> bool:
+    lowered_layout = scene.layout_style.lower()
+    lowered_strategy = scene.visual_strategy.lower()
+    text_slide_prone_types = {
+        "title_card",
+        "title_intro",
+        "hook_question",
+        "comparison",
+        "recap_card",
+        "summary_board",
+    }
+    return (
+        "bullet" in lowered_layout
+        or "list" in lowered_layout
+        or "bullet" in lowered_strategy
+        or "list" in lowered_strategy
+        or len(scene.on_screen_text) >= 5
+        or (scene.scene_type in text_slide_prone_types and len(scene.on_screen_text) >= 4)
+    )
 
 
 def validate_storyboard(storyboard: Storyboard) -> StoryboardValidationReport:
@@ -79,6 +101,72 @@ def validate_storyboard(storyboard: Storyboard) -> StoryboardValidationReport:
                     field_name="pedagogical_role",
                 )
             )
+        if not scene.visual_focus.strip():
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="missing_visual_focus",
+                    message="Every storyboard scene must include a clear visual_focus.",
+                    scene_id=scene.scene_id,
+                    field_name="visual_focus",
+                )
+            )
+        if not scene.semantic_color_roles:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="missing_semantic_color_roles",
+                    message="Every storyboard scene must assign at least one semantic color role.",
+                    scene_id=scene.scene_id,
+                    field_name="semantic_color_roles",
+                )
+            )
+        else:
+            seen_targets: dict[str, str] = {}
+            accent_roles = {
+                assignment.role
+                for assignment in scene.semantic_color_roles
+                if assignment.role in ACCENT_ROLES
+            }
+            for assignment in scene.semantic_color_roles:
+                key = assignment.target.strip().lower()
+                if not key:
+                    issues.append(
+                        ValidationIssue(
+                            severity="error",
+                            code="empty_semantic_color_target",
+                            message="Semantic color assignments need a non-empty target.",
+                            scene_id=scene.scene_id,
+                            field_name="semantic_color_roles",
+                        )
+                    )
+                    continue
+                previous_role = seen_targets.get(key)
+                if previous_role is not None and previous_role != assignment.role:
+                    issues.append(
+                        ValidationIssue(
+                            severity="error",
+                            code="conflicting_semantic_color_role",
+                            message=(
+                                f"Target '{assignment.target}' is assigned multiple semantic color roles "
+                                "within the same scene."
+                            ),
+                            scene_id=scene.scene_id,
+                            field_name="semantic_color_roles",
+                        )
+                    )
+                else:
+                    seen_targets[key] = assignment.role
+            if len(accent_roles) > 3:
+                issues.append(
+                    ValidationIssue(
+                        severity="warning",
+                        code="too_many_accent_roles",
+                        message="Scene uses too many accent color roles. Keep emphasis to one or two accents when possible.",
+                        scene_id=scene.scene_id,
+                        field_name="semantic_color_roles",
+                    )
+                )
 
         narration_word_count = count_words(scene.narration_text)
         if narration_word_count > MAX_SCENE_NARRATION_WORDS:
@@ -115,6 +203,25 @@ def validate_storyboard(storyboard: Storyboard) -> StoryboardValidationReport:
                     severity="warning",
                     code="heavy_on_screen_text",
                     message="On-screen text is getting dense. Let narration carry more of the explanation.",
+                    scene_id=scene.scene_id,
+                    field_name="on_screen_text",
+                )
+            )
+        if _looks_like_text_slide(scene):
+            severity = "warning"
+            code = "generic_text_slide_fallback"
+            message = (
+                "Scene is drifting toward a generic text-slide layout. Prefer a stronger diagram, flow, contrast, or concept-focused structure."
+            )
+            if scene.scene_type in {"title_card", "title_intro", "recap_card", "summary_board"} and len(scene.on_screen_text) >= 5:
+                severity = "error"
+                code = "text_slide_overuse"
+                message = "Scene looks like a dense title-and-bullets fallback. Reduce text and strengthen the visual strategy."
+            issues.append(
+                ValidationIssue(
+                    severity=severity,
+                    code=code,
+                    message=message,
                     scene_id=scene.scene_id,
                     field_name="on_screen_text",
                 )
